@@ -8547,3 +8547,1566 @@ gcc webserv_linux.c -D_REENTRANT -o web_serv -lpthread
         HTTP 协议是无状态的 Stateless 协议，因为其在 1 次请求和响应过程完成后立即断开连接。因此，如果同一服务器端和客户端需要 3 次请求及响应，则意味着需要经过 3 次套接字的创建过程。OK
         服务端向客户端传递的状态码中含有请求处理结果的信息。OK
         HTTP 协议是基于因特网的协议，因此，为了同时向大量客户端提供服务，HTTP 协议被设计为 Stateless 协议。OK
+
+
+
+TCP 连接的建立与断开
+
+    一对套接字唯一标识了网络上的一个 TCP 连接，它是一个四元组，包括本地 IP 地址、本地 TCP 端口号、目的 IP 地址、目的 TCP 端口号
+
+    端口号为 16 位，取值为 0-65535，可划分为三段
+        0-1023：well-known port，也是 Unix 保留端口，只能赋予特权用户进程的套接字，由 IANA（The Internet Assigned Numbers Authority，互联网数字分配机构） 分配和控制，相同端口号将分配给同一服务，如 SSH 的 22 端口、HTTP 的 80 端口
+        1024-49151：registered port，不受 IANA 控制，由 IANA 登记并提供它们的使用情况清单
+        49152-65535：dynamic 或 private，临时端口，49152 = 65536 * 0.75
+
+    建立 TCP 连接的三次握手过程如下
+        第一次握手：server 调用 bind 和 listen 后，处于 LISTEN 状态。client 调用 connect 向 server 发送一个 SYN，进入 SYN_SENT 状态，SYN 的序列号是一个随机生成的 ISN（Initial Sequence Number），随时间变化
+        第二次握手：server 收到 SYN 后，向 client 发送一个 SYN + ACK，状态由 LISTEN 转为 SYN_RCVD，这个 SYN 的序列号也是随机的，而 ACK 序列号为 client 传过来的 SYN 的序列号加 1
+        第三次握手：client 收到 server 的 SYN + ACK 后，向 server 发送一个 ACK，状态由 SYN_SENT 转为 ESTABLISHED，同理，ACK 的序列号为 server 传过来的 SYN 的序列号加 1
+        最后 server 收到 ACK，状态由 SYN_RCVD 转为 ESTABLISHED，双方进入 ESTABLISHED 状态，TCP 连接建立完毕
+
+    断开 TCP 连接的四次挥手的前两次挥手，其中 F 表示 FIN
+        第一次挥手：client 调用 close 向 server 发送 FIN + ACK，进入 FIN_WAIT_1 状态
+        第二次挥手：server 收到 FIN + ACK 后，发送一个 ACK，进入 CLOSE_WAIT 状态，这个状态是为了让 server 继续发送没传完的数据，正因为有可能存在没传完的数据，所以断开连接的过程要比建立连接多一次。
+        client 收到 ACK 后，状态由 FIN_WAIT_1 转为 FIN_WAIT_2
+        第三次挥手：server 调用 close 向 client 发送 FIN + ACK，状态由 CLOSE_WAIT 转为 LAST_ACK
+        第四次挥手：client 收到 FIN + ACK 后，发送一个 ACK，状态由 FIN_WAIT_2 转为 TIME_WAIT。server 收到 ACK 后，状态由 LAST_ACK 转为 CLOSED，
+        2MSL（Maximum Segment Lifetime，最大段生存期）后，client 状态由 TIME_WAIT 转为 CLOSED
+        TIME_WAIT 存在的理由
+            可靠地实现 TCP 全双工连接的终止，如果 server 没有收到 client 最后发送的 ACK，就会重发 FIN + ACK，client 再重发 ACK，并重启 2MSL 计时器
+            允许老的重复分节在网络中消逝，比如关闭了一个连接，不久又在相同的 IP 和端口间建立另一个连接，TIME_WAIT 可以防止此情况发生。
+        对于处于 TIME_WAIT 状态的端口，调用 bind 将失败，因此一般会在创建套接字时设置 SO_REUSEADDR 选项，这样即使端口处于 TIME_WAIT 状态也能被 bind
+    任何 TCP 实现都要为 MSL 选择一个值，RFC 793 规定 MSL 为 2分钟（For this specification the MSL is taken to be 2 minutes）。
+
+基本 TCP 套接字 API
+
+    为了执行网络 I/O，一个进程必须做的第一件事就是创建 socket 描述符。指定期望的协议类型，成功时返回一个小的非负整数值
+
+#include <sys/types.h>
+#include <sys/socket.h>
+
+int socket(int domain, int type, int protocal);
+
+    domain：协议族，一般是 AF_INET，它决定了 socket 地址类型，如 AF_INET 决定要用 32 位 IPv4 地址和 16 位端口号 组合，常用的协议族有 AF_INET(IPv4)、AF_INET6(IPv6)、AF_LOCAL（或称 AF_UNIX，Unix 域 socket）、AF_ROUTE
+    type：socket 类型，一般是 SOCK_STREAM，即 TCP，常用的有 SOCK_STREAM（TCP）、SOCK_DGRAM（UDP）、SOCK_RAW（原始套接字）、SOCK_PACKET、SOCK_SEQPACKET
+    protocol：指定协议，为 0 时自动选择 type 类型对应的协议，常用的有 IPPROTO_TCP、IPPTOTO_UDP、IPPROTO_SCTP、IPPROTO_TIPC，注意 type 和 protocol 必须匹配，不能随意组合
+    示例
+
+int sock = socket(AF_INET, SOCK_STREAM, 0);
+
+    给 socket 描述符绑定一个协议地址。如果调用 connect 或 listen 之前未用 bind 捆绑一个端口，内核就会为描述符分配一个临时端口，一般 TCP 客户端会采用这种做法，而 TCP 服务器应该在 listen 前 bind
+
+#include <sys/types.h>
+#include <sys/socket.h>
+
+int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+
+    示例
+#include <netinet/in.h>
+...
+sockaddr_in address;
+address.sin_family = AF_INET;
+address.sin_port = htons(12345);
+address.sin_addr.s_addr = htonl(INADDR_ANY);
+...
+bind(sock, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+
+    sockaddr_in 定义如下
+
+struct sockaddr_in {
+    short            sin_family;   // 2 bytes e.g. AF_INET, AF_INET6  
+    unsigned short   sin_port;     // 2 bytes e.g. htons(3490)  
+    struct in_addr   sin_addr;     // 4 bytes see struct in_addr, below  
+    ...
+};
+
+struct in_addr {
+    unsigned long s_addr;          // 4 bytes load with inet_pton()  
+};
+
+// sockaddr 和 sockaddr_in 大小都是 16 字节，只不过 sockaddr_in 把 14 个字节的 sa_data 拆开了
+// sin_zero 用于填充字节，保证 sockaddr_in 和 sockaddr 一样大
+struct sockaddr {
+    unsigned short    sa_family;    // 2 bytes address family, AF_xxx  
+    char              sa_data[14];  // 14 bytes of protocol address  
+};
+
+// sockaddr 是给系统用的，程序员应该用 sockaddr_in
+// 通常用类型、IP 地址、端口填充 sockaddr_in 后，转换成 sockaddr 作为参数传递给调用函数
+
+    用 socket 创建的套接字会被假设为主动套接字，即调用 connect 的客户端套接字。listen 将主动套接字转换成被动套接字，将套接字从 CLOSED 状态转换到 LISTEN 状态
+
+#include <sys/types.h>
+#include <sys/socket.h>
+
+int listen(int sockfd, int backlog);
+
+    backlog：套接字（包括 SYS_RCVD 和 ESTABLISHED 队列）最大连接数，如果达到上限，客户端将收到 ECONNREFUSED 错误，一般设为 5
+    listen 只适用于 SOCK_STREAM 和 SOCK_SEQPACKET 的 socket 类型，协议族为 AF_INET 时 backlog 最大可设为 128
+    示例
+
+listen(sock, 5);
+
+    TCP 服务器调用accept，用于从 ESTABLISHED 队列头返回下一个已完成连接，如果队列为空则进程阻塞
+
+#include <sys/types.h>
+#include <sys/socket.h>
+
+int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+
+    第一个参数为服务端的监听描述符，accept 成功时返回一个自动生成的客户端描述符。监听描述符在服务器的生命期内一直存在，客户端描述符在服务器完成对给定客户的服务时关闭
+    addr 和 addrlen 用来保存已连接的客户端的协议地址
+    addrlen 调用前为 addr 所指的套接字地址结构的长度，返回时为由内核存放在该套接字地址结构内的确切字节数
+    示例
+
+sockaddr_in client_address;
+socklen_t len = sizeof(client_address);
+int client_fd = accept(sock, reinterpret_cast<sockaddr*>(&client_address), &len);
+if (client_fd != -1) {
+  std::cout << "ip: " << inet_ntoa(client_address.sin_addr) << '\n';
+  std::cout << "port: " << ntohs(client_address.sin_port) << '\n';
+}
+...
+
+    TCP 客户端调用connect 前可以不 bind，内核会确定源 IP 地址并选择一个临时端口。如果是 TCP 套接字，调用 connect 将触发 TCP 的三次握手，且仅在连接成功或出错时才返回
+
+#include <sys/types.h>
+#include <sys/socket.h>
+
+int connect(int sockfd, const struct sockaddr *servaddr, socklen_t addrlen);
+
+    示例
+
+sockaddr_in server;
+memset(&server, 0, sizeof(server));
+server.sin_family = AF_INET;
+server.sin_port = htons(12345);
+inet_pton(AF_INET, "192.168.211.129", &server.sin_addr);
+connect(sock, reinterpret_cast<sockaddr*>(&server), sizeof(server));
+
+    tcp服务端和客户端调用close关闭套接字，终止 TCP 连接。并发服务器中父进程关闭已连接套接字只是导致相应描述符的引用计数值减 1，仅在该计数变为 0 时才关闭套接字
+
+#include <unistd.h>
+
+int close(int sockfd);
+
+    示例
+
+close(sock);
+
+字符处理函数
+
+    字节操控函数
+
+#include <strings.h>
+
+void bzero(void *s, size_t n);
+void bcopy(const void *src, void *dest, size_t n);
+int bcmp(const void *s1, const void *s2, size_t n); // 相等返回 0，否则返回非 0
+
+    网络字节序通常为大端字节序，主机字节序通常为小端字节序。以下函数提供了主机字节序和网络字节序之间的转换
+
+#include <arpa/inet.h>
+
+ // 主机字节序转网络字节序
+unit16_t htons(unit16_t hostshort); // 一般用于端口号
+uint32_t htonl(uint32_t hostlong); // 一般用于 IP 地址
+
+ // 网络字节序转主机字节序
+uint16_t ntohs(uint16_t netshort); // 一般用于端口号
+uint32_t ntohl(uint32_t netlong); // 一般用于 IP 地址
+
+    点分十进制字符串（即 xxx.xxx.xxx.xxx）转网络字节序
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+// 将 cp 转换为 32 位网络字节序二进制值并存储在 inp 中。字符串有效返回 1，否则返回 0
+int inet_aton(const char *cp, struct in_addr *inp);
+
+// 将点分十进制字符串 cp 转为 IPv4 地址，字符串有效则返回 32 位二进制网络字节序的IPv4地址
+// 否则为INADDR_NONE，通常是-1，即32位均为1，即255.255.255.255，这也意味着不能处理255.255.255.255
+// 现在inet_addr已被废弃
+in_addr_t inet_addr(const char *cp);
+
+// 返回指向点分十进制字符串的指针，返回值所指向的字符串驻留在静态内存中，因此该函数是不可重入的
+char *inet_ntoa(struct in_addr in);
+
+    inet_pton 和 inet_ntop 是随 IPv6 出现的新函数，对 IPv4 和 IPv6 都适用
+
+#include <arpa/inet.h>
+
+// 成功返回1，输入不是有效的表达式返回0，出错返回-1
+int inet_pton(int af, const char *src, void *dst);
+
+// 成功返回指向结果的指针，出错返回NULL
+const char* inet_ntop(int af, const void *src, char *dst, socklen_t size);
+
+// 在<netinet/in.h>中有如下定义，可用作size
+// 如果size太小,不足以容纳表达式结果,则返回一个空指针，并置errno为ENOSPC
+#define INET_ADDRSTRLEN 16
+#define INET6_ADDRSTRLEN 46
+
+    inet_pton 和 inet_ntop 示例
+
+const char* ip = "192.168.211.129";
+inet_pton(AF_INET, ip, &foo.sin_addr); // foo.sin_add.s_addr = inet_addr(ip);
+
+char s[INET_ADDRSTRLEN];
+const char* p = inet_ntop(AF_INET, &foo.sin_addr, s, sizeof(s)); // p = inet_ntoa(foo.sin_addr);
+
+    fork 创建一个新的子进程，在子进程中返回值为 0，在父进程中返回值为子进程的 PID，在子进程中可以通过 getppid 获取父进程的 PID，如果 fork 调用失败，则返回 -1
+
+#include <sys/types.h>
+#include <unistd.h>
+
+pid_t fork(void);
+
+    子进程和父进程继续执行 fork 调用之后的指令，但不确定先后顺序。子进程是父进程的副本，子进程不共享父进程的数据空间和堆栈，
+    不过由于 fork 之后经常紧跟 exec，所以现在很多实现并不执行一个完全的副本，而是使用写时复制（Copy-On-Write，COW）技术，让父子空间共享区域，并将它们的访问权限改变为只读，
+    如果任何一个父子进程要修改这些区域，内核会只为修改区域的那块内存制作一个副本，这个副本通常是虚拟内存中的一页
+
+int i = 0;
+pid_t pid = fork();
+
+if (pid == -1) {
+  std::cerr << "errno: " << errno << '\n';
+} else if (pid == 0) {
+  std::cout << "child id: " << getpid() << '\n';
+  std::cout << "parent id:" << getppid() << '\n';
+  ++i；
+} else {
+  std::cout << "child id: " << pid << '\n';
+  std::cout << "parent id: " << getpid() << '\n';
+}
+
+std::cout << i;  // 在子进程中为 1，在父进程中为 0
+
+    fork 有两个典型用法
+        一个进程创建一个自身的副本，这样每个副本都可以在另一个副本执行其他任务的同时处理各自的某个操作，这是网络服务器的典型用法
+        一个进程想要执行另一个程序，先 fork 一个自身的副本，然后其中一个副本调用 exec 把自身替换成新的程序，这是 Shell 之类的程序的典型用法
+
+五种 I/O 模型
+
+    一个输入操作通常包括两个阶段
+        等待数据准备好，从网络中到达时复制到内核的某个缓冲区
+        从内核缓冲区向进程缓冲区复制数据
+    同步 I/O 操作的四种模型都会导致请求进程阻塞，直到 I/O 操作完成，它们第二阶段都一样，主要区别在第一阶段
+        blocking I/O（阻塞 I/O）：最常见的模型，Linux 中默认所有 socket 都是阻塞的。进程调用 recvfrom，内核等待数据到达，用户线程阻塞，
+        内核接收到数据后，将其拷贝到进程缓冲区，并返回结果，此时用户才解除阻塞状态。整个 I/O 请求过程中，用户线程都是阻塞的，不能做任何事，CPU 资源利用率低
+        non-blocking I/O（非阻塞 I/O）：即轮询内核。进程调用 recvfrom 时没有数据返回，内核不阻塞用户，而是返回一个 EWOULDBLOCK 错误，虽然没读取任何数据，但用户能马上得到返回结果。
+        用户收到错误码，知道内核还没准备好，会不断发送请求直到内核准备好数据，此时内核再把数据拷贝到进程缓冲区然后返回。轮询会消耗大量 CPU 资源，一般很少直接用非阻塞 I/O，而是在其他 I/O 模型中使用这一特性
+        I/O multiplexing（I/O 多路复用）：最常用的 I/O 模型，可以理解为某些进程需要的一种预先告知内核的能力，使得内核一旦发现进程指定的一个或多个 I/O 条件就绪（即输入已准备好被读取，或描述符已能承接更多的输出），它就通知进程。
+        I/O 多路复用建立在内核提供的 select 函数的基础上，用于避免非阻塞 I/O 的轮询等待问题。用户先将要进行 I/O 操作的文件描述符放到 select 中，select 会阻塞，直到当文件描述符可读时返回。
+        select 的优势在于可以直接用单线程监听多个文件描述符，如果用阻塞 I/O 则需要多线程才能实现此目的。 select 会阻塞线程（但不阻塞 socket），所以 I/O 多路复用模型也叫异步阻塞 I/O 模型，但不算真正的异步 I/O
+        signal-driven I/O（信号驱动式 I/O）：通过 sigaction 函数安装信号处理函数，如果数据不可用，进程继续工作而不会阻塞，当数据准备好时，内核为该进程产生一个 SIGIO 信号，
+        随后即可以在信号处理函数中调用 recvfrom 读取数据，并通知主循环数据已准备好待处理，也可以立即通知主循环让它读取数据报。这种模型的优势在于等待数据到达期间不被阻塞
+    异步 I/O 操作
+        asynchronous I/O（异步 I/O）：通知内核启动某个操作，内核在完成操作后通知用户。信号驱动模型是内核通知用户可以启动 I/O 操作的时机，而异步 I/O 是通知完成 I/O 操作的时机。
+        异步 I/O 相比于 I/O 多路复用并不常用，I/O 多路复用加上多线程任务处理架构能满足大多数高性能并发程序要求
+    同步异步的区别：同步发出调用时，没得到结果就不返回，异步 I/O 发出调用不会马上得到返回结果。简单来说，同步 I/O 必须做完一件事才会做下一件事，会阻塞线程的 I/O 操作就是同步 I/O，因此前四种都是同步 I/O
+
+IO多路复用API
+
+    调用 select 函数会让内核轮询 fd_set，直到某个 fd_set 有就绪的文件描述时返回，内核标记该文件描述符所在的位，未就绪的位均置零。
+    传入的第一个参数表示内核对 fd_set 轮询的位数，轮询范围应该为 0 到最大的文件描述符，因此第一个参数一般设置为最大文件描述符加 1
+
+#include <sys/select.h>
+#include <sys/time.h>
+
+// 文件描述符就绪则返回其数目，超时返回 0，出错返回 -1
+extern int select (int __nfds, fd_set *__restrict __readfds,
+           fd_set *__restrict __writefds,
+           fd_set *__restrict __exceptfds,
+           struct timeval *__restrict __timeout);
+
+    如果设置了超时时间，即使没有文件描述符就绪，也会在超时时间返回。虽然 timeval 可以设置到微秒级，但内核的实际支持往往粗糙得多，一般 Unix 内核会往 10 ms 的倍数向上取整
+
+struct timeval
+{
+  __time_t tv_sec;        /* Seconds.  */
+  __suseconds_t tv_usec;    /* Microseconds.  */
+};
+
+    fd_set 的本质是一个 long int 数组
+
+    大小为 1024 位
+
+    因此 fd_set 也相当于一个 bit_map，FD_SET 函数根据文件描述符的值，将对应的 fd_set 位置 1
+
+void FD_SET(int fd, fd_set *fdset);
+
+    当 select 返回时，仅表示有文件描述符就绪，但不知道是哪一个，因此还需要再次遍历所有文件描述符做 FD_ISSET 检查。
+    另外，select 会修改传入的参数，因此下一次调用 select 时仍要重新设置 fd_set 和 timeout（timeout 会被清零，如果不重新设置，没有描述符就绪就会直接超时）。
+    可以通过如下四个函数操作 fd_set，其实现本质是位运算，比如 FD_SET 先除以数组每个元素的大小找出新的 fd 所在的下标，再将 1 左移余数数量位的结果与该元素求或
+
+#include <sys/select.h>
+
+void FD_ZERO(fd_set *fdset);
+void FD_SET(int fd, fd_set *fdset);
+void FD_CLR(int fd, fd_set *fdset);
+int FD_ISSET(int fd, fd_set *fdset);
+这些宏按如下方式工作。
+● FD_ZERO()将 fdset 所指向的集合初始化为空。
+● FD_SET()将文件描述符 fd 添加到由 fdset 所指向的集合中。
+● FD_CLR()将文件描述符 fd 从 fdset 所指向的集合中移除。
+● 如果文件描述符 fd 是 fdset 所指向的集合中的成员，FD_ISSET()返回 true。
+文件描述符集合有一个最大容量限制，由常量 FD_SETSIZE 来决定。在 Linux 上，该常量的值为 1024。（其他 UNIX 实现对于该限制也有类似的常量值来限定。）
+
+    通常一个 select 函数的调用过程如下
+
+// 准备多个 fd，保存到一个 fds 数组中，最大的记为 max_fd
+fd_set read_fds;
+fd_set cpy_read_fds;
+
+FD_ZERO(&read_fds);
+FD_SET(fds[0], &read_fds);
+FD_SET(fds[1], &read_fds);
+FD_SET(fds[2], &read_fds);
+
+while (true) {
+  cpy_read_fds = read_fds;
+  timeval timeout;
+  timeout.tv_sec = 1;
+  timeout.tv_usec = 0;
+  int ret = select(max_fd + 1, &cpy_read_fds, nullptr, nullptr, &timeout);
+  if (ret == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    break;
+  }
+  if (ret == 0) {
+    std::cout << "timeout" << '\n';
+    continue;
+  }
+  for (int i = 0; i < fd_count; ++i) {
+    if (FD_ISSET(fds[i], &cpy_read_fds)) {
+      ...
+    }
+  }
+}
+
+    poll 的原理和 select 相同，只不过参数类型有一些区别，poll 轮询的数据结构是元素类型为 pollfd 的数组（因此监听的文件描述符不仅限于 1024 个），nfds 是元素个数，timeout 是一个表示毫秒的整型
+
+#include <poll.h>
+
+int poll (struct pollfd *__fds, nfds_t __nfds, int __timeout);
+
+struct pollfd
+  {
+    int fd;            /* File descriptor to poll.  */
+    short int events;        /* Types of events poller cares about.  */
+    short int revents;        /* Types of events that actually occurred.  */
+  };
+
+/* Event types that can be polled for.  These bits may be set in `events'
+   to indicate the interesting event types; they will appear in `revents'
+   to indicate the status of the file descriptor.  */
+#define POLLIN         0x001        /* There is data to read.  */
+#define POLLPRI        0x002        /* There is urgent data to read.  */
+#define POLLOUT        0x004        /* Writing now will not block.  */
+
+#if defined __USE_XOPEN || defined __USE_XOPEN2K8
+/* These values are defined in XPG4.2.  */
+# define POLLRDNORM    0x040        /* Normal data may be read.  */
+# define POLLRDBAND    0x080        /* Priority data may be read.  */
+# define POLLWRNORM    0x100        /* Writing now will not block.  */
+# define POLLWRBAND    0x200        /* Priority data may be written.  */
+#endif
+
+#ifdef __USE_GNU
+/* These are extensions for Linux.  */
+# define POLLMSG    0x400
+# define POLLREMOVE    0x1000
+# define POLLRDHUP     0x2000
+#endif
+
+/* Event types always implicitly polled for.  These bits need not be set in
+   `events', but they will appear in `revents' to indicate the status of
+   the file descriptor.  */
+#define POLLERR        0x008        /* Error condition.  */
+#define POLLHUP        0x010        /* Hung up.  */
+#define POLLNVAL       0x020        /* Invalid polling request.  */
+
+    通常 poll 函数的调用过程如下
+
+std::vector<pollfd> pollfds(1);
+pollfds[0].fd = listen_fd;
+pollfds[0].events = POLLIN;
+
+while (true) {
+  constexpr int timeout = 1000;
+  int ret = poll(pollfds.data(), pollfds.size(), timeout);
+  if (ret == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    break;
+  }
+  if (ret == 0) {
+    std::cout << "timeout" << '\n';
+    continue;
+  }
+  for (int i = 0; i < pollfds.size(); ++i) {
+    if (pollfds[i].revents & POLLIN) {
+      ...
+    }
+  }
+}
+
+    epoll 在 Linux 2.5.44 中首次出现，使用前需要先创建一个 epfd，内核会分配一个对应的 eventpoll
+
+/* Creates an epoll instance.  Returns an fd for the new instance.
+   The "size" parameter is a hint specifying the number of file
+   descriptors to be associated with the new instance.  The fd
+   returned by epoll_create() should be closed with close().  */
+extern int epoll_create (int __size) __THROW;
+
+/* Same as epoll_create but with an FLAGS parameter.  The unused SIZE
+   parameter has been dropped.  */
+extern int epoll_create1 (int __flags) __THROW;
+
+    用文件描述符生成一个 epoll_event 对象
+
+typedef union epoll_data
+{
+  void *ptr;
+  int fd;
+  uint32_t u32;
+  uint64_t u64;
+} epoll_data_t;
+
+struct epoll_event
+{
+  uint32_t events;	/* Epoll events */
+  epoll_data_t data;	/* User data variable */
+} __EPOLL_PACKED;
+
+    随后将 epoll_event 添加到 epfd 中，eventpoll 以红黑树的数据结构存储 epitem，因此 epoll_ctl 的时间复杂度为 O(log n)。
+    每个文件描述符只会有一次从用户态到内核的拷贝，不存在 select 和 poll 的重复拷贝的情况，随着文件描述符数量增加，select 和 poll 的响应速度将线性下降，而 epoll 基本不受影响。
+    epoll_ctl 的实现中是有锁的，因此是线程安全的
+
+/* Valid opcodes ( "op" parameter ) to issue to epoll_ctl().  */
+#define EPOLL_CTL_ADD 1	/* Add a file descriptor to the interface.  */
+#define EPOLL_CTL_DEL 2	/* Remove a file descriptor from the interface.  */
+#define EPOLL_CTL_MOD 3	/* Change file descriptor epoll_event structure.  */
+
+/* Manipulate an epoll instance "epfd". Returns 0 in case of success,
+   -1 in case of error ( the "errno" variable will contain the
+   specific error code ) The "op" parameter is one of the EPOLL_CTL_*
+   constants defined above. The "fd" parameter is the target of the
+   operation. The "event" parameter describes which events the caller
+   is interested in and any associated user data.  */
+extern int epoll_ctl (int __epfd, int __op, int __fd,
+		      struct epoll_event *__event) __THROW;
+
+    事件发生时，对应的文件描述符会被添加到一个链表中，epoll_wait 直接遍历链表即可获取所有就绪的文件描述符。epoll_wait 和 epoll_ctl 一样是线程安全的
+
+/* Wait for events on an epoll instance "epfd". Returns the number of
+   triggered events returned in "events" buffer. Or -1 in case of
+   error with the "errno" variable set to the specific error code. The
+   "events" parameter is a buffer that will contain triggered
+   events. The "maxevents" is the maximum number of events to be
+   returned ( usually size of "events" ). The "timeout" parameter
+   specifies the maximum wait time in milliseconds (-1 == infinite).
+
+   This function is a cancellation point and therefore not marked with
+   __THROW.  */
+extern int epoll_wait (int __epfd, struct epoll_event *__events,
+		       int __maxevents, int __timeout);
+
+    epoll 可以注册如下事件类型，其中 EPOLLET 表示边缘触发（Edge Triggered）模式，即 epoll 检查到事件触发后必须立即处理，下次不会再通知 epoll_wait，
+    ET 减少了 epoll 事件重复触发的次数，结合 non-blocking 非常高效。如果不设置 ET，则默认使用电平触发（Level Triggered）模式，即此次未被处理的事件下次会继续通知 epoll_wait，直到被处理。
+
+enum EPOLL_EVENTS
+  {
+    EPOLLIN = 0x001,
+#define EPOLLIN EPOLLIN
+    EPOLLPRI = 0x002,
+#define EPOLLPRI EPOLLPRI
+    EPOLLOUT = 0x004,
+#define EPOLLOUT EPOLLOUT
+    EPOLLRDNORM = 0x040,
+#define EPOLLRDNORM EPOLLRDNORM
+    EPOLLRDBAND = 0x080,
+#define EPOLLRDBAND EPOLLRDBAND
+    EPOLLWRNORM = 0x100,
+#define EPOLLWRNORM EPOLLWRNORM
+    EPOLLWRBAND = 0x200,
+#define EPOLLWRBAND EPOLLWRBAND
+    EPOLLMSG = 0x400,
+#define EPOLLMSG EPOLLMSG
+    EPOLLERR = 0x008,
+#define EPOLLERR EPOLLERR
+    EPOLLHUP = 0x010,
+#define EPOLLHUP EPOLLHUP
+    EPOLLRDHUP = 0x2000,
+#define EPOLLRDHUP EPOLLRDHUP
+    EPOLLEXCLUSIVE = 1u << 28,
+#define EPOLLEXCLUSIVE EPOLLEXCLUSIVE
+    EPOLLWAKEUP = 1u << 29,
+#define EPOLLWAKEUP EPOLLWAKEUP
+    EPOLLONESHOT = 1u << 30,
+#define EPOLLONESHOT EPOLLONESHOT
+    EPOLLET = 1u << 31
+#define EPOLLET EPOLLET
+  };
+
+    通常 epoll 的调用过程如下
+
+int epfd = epoll_create1(0);
+epoll_event ev;
+ev.data.fd = fd;
+ev.events = EPOLLIN | EPOLLET;
+epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);  // SetNonBlocking
+std::vector<epoll_event> v(1000);
+while (true) {
+  int ret = epoll_wait(epfd, v.data(), v.size(), -1);
+  if (ret == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    break;
+  }
+  for (int i = 0; i < ret; ++i) {
+    if (v[i].data.fd == listen_fd) {
+      ...  // do_accept
+    } else if (v[i].events & EPOLLIN) {
+      ...  // do_read
+    } else if (v[i].events & EPOLLOUT) {
+      ...  // do_write
+    }
+  }
+}
+
+
+
+udp_client.cpp
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cassert>
+#include <cstring>
+#include <iostream>
+
+sockaddr_in SockAddress(int port, const std::string& ip) {
+  sockaddr_in res;
+  bzero(&res, sizeof(res));
+  res.sin_family = AF_INET;
+  res.sin_port = htons(port);
+  inet_pton(AF_INET, ip.c_str(), &res.sin_addr);
+  return res;
+}
+
+bool PrintReceiveMessage(int fd) {
+  char buf[1024] = {};
+  int n = recvfrom(fd, buf, sizeof(buf) - 1, 0, nullptr, nullptr);
+  if (n <= 0) {
+    return false;
+  }
+  std::cout << n << " bytes message: " << buf << std::endl;
+  return true;
+}
+
+void Send(int fd, const std::string& s, sockaddr_in* server_address) {
+  sendto(fd, s.c_str(), strlen(s.c_str()), 0,
+         reinterpret_cast<sockaddr*>(server_address), sizeof(*server_address));
+}
+
+int main() {
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  assert(fd != -1);
+  sockaddr_in server_address = SockAddress(12345, "0.0.0.0");
+  Send(fd, "hello world!", &server_address);
+  PrintReceiveMessage(fd);
+  close(fd);
+}
+
+udp_server.cpp
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cassert>
+#include <cstring>
+#include <iostream>
+#include <string>
+
+sockaddr_in SockAddress(int port, const std::string& ip) {
+  sockaddr_in res;
+  res.sin_family = AF_INET;
+  res.sin_port = htons(port);
+  inet_pton(AF_INET, ip.c_str(), &res.sin_addr);
+  bzero(&(res.sin_zero), 8);
+  return res;
+}
+
+int UDPFd(int port, const std::string& ip) {
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  sockaddr_in address = SockAddress(port, ip);
+  if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  return fd;
+}
+
+bool PrintReceiveMessage(int fd, sockaddr_in* client_address) {
+  char buf[1024] = {};
+  socklen_t len = sizeof(client_address);
+  int n = recvfrom(fd, buf, sizeof(buf) - 1, 0,
+                   reinterpret_cast<sockaddr*>(client_address), &len);
+  if (n <= 0) {
+    return false;
+  }
+  std::cout << n << " bytes message: " << buf << '\n';
+  return true;
+}
+
+void Send(int fd, const std::string& s, sockaddr_in* client_address) {
+  sendto(fd, s.c_str(), strlen(s.c_str()), 0,
+         reinterpret_cast<sockaddr*>(client_address), sizeof(*client_address));
+}
+
+int main() {
+  int fd = UDPFd(12345, "0.0.0.0");
+  assert(fd != -1);
+  sockaddr_in client_address;
+  PrintReceiveMessage(fd, &client_address);
+  Send(fd, "welcome to join", &client_address);
+  close(fd);
+}
+
+
+
+tcp_client.cpp
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cassert>
+#include <cstring>
+#include <iostream>
+
+sockaddr_in SockAddress(int port, const std::string& ip) {
+  sockaddr_in res;
+  bzero(&res, sizeof(res));
+  res.sin_family = AF_INET;
+  res.sin_port = htons(port);
+  inet_pton(AF_INET, ip.c_str(), &res.sin_addr);
+  return res;
+}
+
+int Connect(int port, const std::string& ip) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  sockaddr_in address = SockAddress(port, ip);
+  if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == -1)
+  {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  return fd;
+}
+
+bool PrintReceiveMessage(int fd) {
+  char buf[1024] = {};
+  int n = recv(fd, buf, sizeof(buf) - 1, 0);
+  if (n <= 0) {
+    return false;
+  }
+  std::cout << n << " bytes message: " << buf << '\n';
+  return true;
+}
+
+int main() {
+  int fd = Connect(12345, "0.0.0.0");
+  assert(fd != -1);
+  PrintReceiveMessage(fd);
+  close(fd);
+}
+
+tcp_server.cpp
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cassert>
+#include <cstring>
+#include <iostream>
+#include <string>
+
+sockaddr_in SockAddress(int port, const std::string& ip) {
+  sockaddr_in res;
+  res.sin_family = AF_INET;
+  res.sin_port = htons(port);
+  inet_pton(AF_INET, ip.c_str(), &res.sin_addr);  // res.sin_addr.s_addr = htonl(INADDR_ANY);
+  bzero(&(res.sin_zero), 8);
+  return res;
+}
+
+int ListenFd(int port, const std::string& ip, int backlog = 5) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  int reuse = 1;
+  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  sockaddr_in address = SockAddress(port, ip);
+  if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  if (listen(fd, backlog) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  return fd;
+}
+
+int AcceptFd(int listen_fd) {
+  sockaddr_in client;
+  socklen_t client_address_length = sizeof(client);
+  int accept_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&client), &client_address_length);
+  if (accept_fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  std::cout << "receive connect request from " << inet_ntoa(client.sin_addr)
+            << ':' << ntohs(client.sin_port) << '\n';
+  return accept_fd;
+}
+
+void Send(int accept_fd, const std::string& s) {
+  send(accept_fd, s.c_str(), strlen(s.c_str()), 0);
+}
+
+int main() {
+  int listen_fd = ListenFd(12345, "0.0.0.0");
+  assert(listen_fd != -1);
+  int accept_fd = AcceptFd(listen_fd);
+  assert(accept_fd != -1);
+  Send(accept_fd, "welcome to join");
+  close(accept_fd);
+  close(listen_fd);
+}
+
+fork_tcp_client.cpp
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cassert>
+#include <cstring>
+#include <iostream>
+
+sockaddr_in SockAddress(int port, const std::string& ip) {
+  sockaddr_in res;
+  bzero(&res, sizeof(res));
+  res.sin_family = AF_INET;
+  res.sin_port = htons(port);
+  inet_pton(AF_INET, ip.c_str(), &res.sin_addr);
+  return res;
+}
+
+int Connect(int port, const std::string& ip) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  sockaddr_in address = SockAddress(port, ip);
+  if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  return fd;
+}
+
+bool PrintReceiveMessage(int fd) {
+  char buf[1024] = {};
+  int n = recv(fd, buf, sizeof(buf) - 1, 0);
+  if (n <= 0) {
+    return false;
+  }
+  std::cout << n << " bytes message: " << buf << '\n';
+  return true;
+}
+
+void Send(int fd, const std::string& s) {
+  send(fd, s.c_str(), strlen(s.c_str()), 0);
+}
+
+int main() {
+  int fd = Connect(12345, "0.0.0.0");
+  assert(fd != -1);
+  PrintReceiveMessage(fd);
+  Send(fd, "hello");
+  close(fd);
+}
+
+fork_tcp_server.cpp
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cassert>
+#include <cstring>
+#include <iostream>
+
+sockaddr_in SockAddress(int port, const std::string& ip) {
+  sockaddr_in res;
+  res.sin_family = AF_INET;
+  res.sin_port = htons(port);
+  inet_pton(AF_INET, ip.c_str(), &res.sin_addr);  // res.sin_addr.s_addr = htonl(INADDR_ANY);
+  bzero(&(res.sin_zero), 8);
+  return res;
+}
+
+int ListenFd(int port, const std::string& ip, int backlog = 5) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  int reuse = 1;
+  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  sockaddr_in address = SockAddress(port, ip);
+  if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  if (listen(fd, backlog) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  return fd;
+}
+
+int AcceptFd(int listen_fd) {
+  sockaddr_in client;
+  socklen_t client_address_length = sizeof(client);
+  int accept_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&client), &client_address_length);
+  if (accept_fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  std::cout << "receive connect request from " << inet_ntoa(client.sin_addr)
+            << ':' << ntohs(client.sin_port) << '\n';
+  return accept_fd;
+}
+
+void Send(int accept_fd, const std::string& s) {
+  send(accept_fd, s.c_str(), strlen(s.c_str()), 0);
+}
+
+bool PrintReceiveMessage(int fd) {
+  char buf[1024] = {};
+  int n = recv(fd, buf, sizeof(buf) - 1, 0);
+  if (n <= 0) {
+    return false;
+  }
+  std::cout << n << " bytes message: " << buf << '\n';
+  return true;
+}
+
+int main() {
+  int listen_fd = ListenFd(12345, "0.0.0.0");
+  assert(listen_fd != -1);
+  while (true) {
+    int accept_fd = AcceptFd(listen_fd);
+    assert(accept_fd != -1);
+    pid_t p = fork();
+    if (p == -1) {
+      std::cout << "errno: " << strerror(errno) << '\n';
+    } else if (p == 0) {
+      close(listen_fd);
+      std::cout << "this is child, "
+                << "child-parent: " << getpid() << " " << getppid() << '\n';
+      Send(accept_fd, "welcome to join");
+      PrintReceiveMessage(accept_fd);
+      close(accept_fd);
+      exit(EXIT_SUCCESS);
+    } else {
+      close(accept_fd);
+      std::cout << "this is parent, "
+                << "child-parent: " << p << " " << getpid() << '\n';
+    }
+  }
+  close(listen_fd);
+}
+
+select_tcp_client.cpp
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <strings.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cassert>
+#include <cstring>
+#include <iostream>
+#include <thread>
+
+sockaddr_in SockAddress(int port, const std::string& ip) {
+  sockaddr_in res;
+  bzero(&res, sizeof(res));
+  res.sin_family = AF_INET;
+  res.sin_port = htons(port);
+  inet_pton(AF_INET, ip.c_str(), &res.sin_addr);
+  return res;
+}
+
+int Connect(int port, const std::string& ip) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  sockaddr_in address = SockAddress(port, ip);
+  if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  return fd;
+}
+
+bool PrintReceiveMessage(int fd) {
+  char buf[1024] = {};
+  int n = recv(fd, buf, sizeof(buf) - 1, 0);
+  if (n <= 0) {
+    return false;
+  }
+  std::cout << n << " bytes message: " << buf << '\n';
+  return true;
+}
+
+void Send(int fd, const std::string& s) {
+  send(fd, s.c_str(), strlen(s.c_str()), 0);
+}
+
+int main() {
+  int fd = Connect(12345, "0.0.0.0");
+  assert(fd != -1);
+  Send(fd, "hello");
+  fd_set read_fds;
+  timeval timeout;
+  while (true) {
+    FD_ZERO(&read_fds);
+    FD_SET(fd, &read_fds);
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+    int ret = select(fd + 1, &read_fds, nullptr, nullptr, &timeout);
+    if (ret == -1) {
+      std::cout << "errno: " << strerror(errno) << '\n';
+      break;
+    }
+    if (ret == 0) {
+      std::cout << "timeout" << '\n';
+      continue;
+    }
+    if (FD_ISSET(fd, &read_fds)) {
+      if (PrintReceiveMessage(fd)) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        Send(fd, "got your message");
+      } else {
+        FD_CLR(fd, &read_fds);
+        break;
+      }
+    }
+  }
+  close(fd);
+}
+
+select_tcp_server.cpp
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <strings.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cassert>
+#include <cstring>
+#include <iostream>
+#include <list>
+
+sockaddr_in SockAddress(int port, const std::string& ip) {
+  sockaddr_in res;
+  res.sin_family = AF_INET;
+  res.sin_port = htons(port);
+  inet_pton(AF_INET, ip.c_str(), &res.sin_addr);  // res.sin_addr.s_addr = htonl(INADDR_ANY);
+  bzero(&(res.sin_zero), 8);
+  return res;
+}
+
+int ListenFd(int port, const std::string& ip, int backlog = 5) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  int reuse = 1;
+  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  sockaddr_in address = SockAddress(port, ip);
+  if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  if (listen(fd, backlog) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  return fd;
+}
+
+int AcceptFd(int listen_fd) {
+  sockaddr_in client;
+  socklen_t client_address_length = sizeof(client);
+  int accept_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&client), &client_address_length);
+  if (accept_fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  std::cout << "receive connect request from " << inet_ntoa(client.sin_addr)
+            << ':' << ntohs(client.sin_port) << '\n';
+  return accept_fd;
+}
+
+void Send(int accept_fd, const std::string& s) {
+  send(accept_fd, s.c_str(), strlen(s.c_str()), 0);
+}
+
+bool PrintReceiveMessage(int fd) {
+  char buf[1024] = {};
+  int n = recv(fd, buf, sizeof(buf) - 1, 0);
+  if (n <= 0) {
+    return false;
+  }
+  std::cout << n << " bytes message: " << buf << '\n';
+  return true;
+}
+
+int main() {
+  int listen_fd = ListenFd(12345, "0.0.0.0");
+  assert(listen_fd != -1);
+  fd_set read_fds;
+  std::list<int> accept_fds;
+  timeval timeout;
+  while (true) {
+    FD_ZERO(&read_fds);
+    FD_SET(listen_fd, &read_fds);
+    int max_fd = listen_fd;
+    for (auto& x : accept_fds) {
+      FD_SET(x, &read_fds);
+      max_fd = std::max(max_fd, x);
+    }
+    timeout.tv_sec = 3;
+    timeout.tv_usec = 0;
+    int ret = select(max_fd + 1, &read_fds, nullptr, nullptr, &timeout);
+    if (ret == -1) {
+      std::cout << "errno: " << strerror(errno) << '\n';
+      break;
+    }
+    if (ret == 0) {
+      std::cout << "timeout" << '\n';
+      continue;
+    }
+    if (FD_ISSET(listen_fd, &read_fds)) {
+      int fd = AcceptFd(listen_fd);
+      accept_fds.emplace_back(fd);
+    }
+    for (auto& x : accept_fds) {
+      if (FD_ISSET(x, &read_fds)) {
+        if (PrintReceiveMessage(x)) {
+          Send(x, "welcome to join");
+        } else {
+          FD_CLR(x, &read_fds);
+          close(x);
+          x = -1;
+        }
+      }
+    }
+    accept_fds.remove(-1);
+  }
+  close(listen_fd);
+}
+
+poll_tcp_client.cpp
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cassert>
+#include <cstring>
+#include <iostream>
+#include <thread>
+#include <vector>
+
+sockaddr_in SockAddress(int port, const std::string& ip) {
+  sockaddr_in res;
+  bzero(&res, sizeof(res));
+  res.sin_family = AF_INET;
+  res.sin_port = htons(port);
+  inet_pton(AF_INET, ip.c_str(), &res.sin_addr);
+  return res;
+}
+
+int Connect(int port, const std::string& ip) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  sockaddr_in address = SockAddress(port, ip);
+  if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  return fd;
+}
+
+bool PrintReceiveMessage(int fd) {
+  char buf[1024] = {};
+  int n = recv(fd, buf, sizeof(buf) - 1, 0);
+  if (n <= 0) {
+    return false;
+  }
+  std::cout << n << " bytes message: " << buf << '\n';
+  return true;
+}
+
+void Send(int fd, const std::string& s) {
+  send(fd, s.c_str(), strlen(s.c_str()), 0);
+}
+
+int main() {
+  int fd = Connect(12345, "0.0.0.0");
+  assert(fd != -1);
+  Send(fd, "hello");
+  std::vector<pollfd> pollfds(1);
+  pollfds[0].fd = fd;
+  pollfds[0].events = POLLIN;
+  while (true) {
+    constexpr int timeout = 1000;
+    int ret = poll(pollfds.data(), pollfds.size(), timeout);
+    if (ret == -1) {
+      std::cout << "errno: " << strerror(errno) << '\n';
+      break;
+    }
+    if (ret == 0) {
+      std::cout << "timeout" << '\n';
+      continue;
+    }
+    if (pollfds.front().revents & POLLIN) {
+      if (PrintReceiveMessage(fd)) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        Send(fd, "got your message");
+      } else {
+        break;
+      }
+    }
+  }
+  close(fd);
+}
+
+poll_tcp_server.cpp
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cassert>
+#include <cstring>
+#include <iostream>
+#include <vector>
+
+sockaddr_in SockAddress(int port, const std::string &ip) {
+  sockaddr_in res;
+  res.sin_family = AF_INET;
+  res.sin_port = htons(port);
+  inet_pton(AF_INET, ip.c_str(), &res.sin_addr);  // res.sin_addr.s_addr = htonl(INADDR_ANY);
+  bzero(&(res.sin_zero), 8);
+  return res;
+}
+
+int ListenFd(int port, const std::string &ip, int backlog = 5) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  int reuse = 1;
+  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  sockaddr_in address = SockAddress(port, ip);
+  if (bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  if (listen(fd, backlog) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  return fd;
+}
+
+int AcceptFd(int listen_fd) {
+  sockaddr_in client;
+  socklen_t client_address_length = sizeof(client);
+  int accept_fd = accept(listen_fd, reinterpret_cast<sockaddr *>(&client), &client_address_length);
+  if (accept_fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  std::cout << "receive connect request from " << inet_ntoa(client.sin_addr)
+            << ':' << ntohs(client.sin_port) << '\n';
+  return accept_fd;
+}
+
+void Send(int accept_fd, const std::string &s) {
+  send(accept_fd, s.c_str(), strlen(s.c_str()), 0);
+}
+
+bool PrintReceiveMessage(int fd) {
+  char buf[1024] = {};
+  int n = recv(fd, buf, sizeof(buf) - 1, 0);
+  if (n <= 0) {
+    return false;
+  }
+  std::cout << n << " bytes message: " << buf << '\n';
+  return true;
+}
+
+int main() {
+  int listen_fd = ListenFd(12345, "0.0.0.0");
+  assert(listen_fd != -1);
+  std::vector<pollfd> pollfds(1);
+  pollfds[0].fd = listen_fd;
+  pollfds[0].events = POLLIN;
+  while (true) {
+    constexpr int timeout = 3000;
+    int ret = poll(pollfds.data(), pollfds.size(), timeout);
+    if (ret == -1) {
+      std::cout << "errno: " << strerror(errno) << '\n';
+      break;
+    }
+    if (ret == 0) {
+      std::cout << "timeout" << '\n';
+      continue;
+    }
+    if (pollfds.front().revents & POLLIN) {
+      pollfd tmp;
+      tmp.fd = AcceptFd(listen_fd);
+      tmp.events = POLLIN;
+      pollfds.emplace_back(std::move(tmp));
+    }
+    for (unsigned i = 1; i < pollfds.size(); ++i) {
+      if (pollfds[i].revents & POLLIN) {
+        if (PrintReceiveMessage(pollfds[i].fd)) {
+          Send(pollfds[i].fd, "welcome to join");
+        } else {
+          close(pollfds[i].fd);
+          pollfds[i].fd = -1;
+        }
+      }
+    }
+    pollfds.erase(std::remove_if(std::begin(pollfds), std::end(pollfds),
+                                 [&](pollfd &x) { return x.fd == -1; }),
+                  std::end(pollfds));
+  }
+  close(listen_fd);
+}
+
+epoll_tcp_client.cpp
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <strings.h>
+#include <sys/epoll.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cassert>
+#include <cstring>
+#include <iostream>
+#include <vector>
+
+sockaddr_in SockAddress(int port, const std::string& ip) {
+  sockaddr_in res;
+  bzero(&res, sizeof(res));
+  res.sin_family = AF_INET;
+  res.sin_port = htons(port);
+  inet_pton(AF_INET, ip.c_str(), &res.sin_addr);
+  return res;
+}
+
+int Connect(int port, const std::string& ip) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  sockaddr_in address = SockAddress(port, ip);
+  if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) ==-1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  return fd;
+}
+
+bool PrintReceiveMessage(int fd) {
+  char buf[1024] = {};
+  int n = recv(fd, buf, sizeof(buf) - 1, 0);
+  if (n <= 0) {
+    return false;
+  }
+  std::cout << n << " bytes message: " << buf << '\n';
+  return true;
+}
+
+void Send(int fd, const std::string& s) {
+  send(fd, s.c_str(), strlen(s.c_str()), 0);
+}
+
+int SetNonBlocking(int fd) {
+  int old_option = fcntl(fd, F_GETFL);
+  int new_option = old_option | O_NONBLOCK;
+  fcntl(fd, F_SETFL, new_option);
+  return old_option;
+}
+
+void AddFd(int epfd, int fd) {
+  epoll_event ev;
+  ev.data.fd = fd;
+  ev.events = EPOLLIN | EPOLLET;
+  epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+  SetNonBlocking(fd);
+}
+
+void ModFd(int epfd, int fd, int op) {
+  epoll_event ev;
+  ev.data.fd = fd;
+  ev.events = op;
+  epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+}
+
+int main() {
+  int fd = Connect(12345, "0.0.0.0");
+  assert(fd != -1);
+  int epfd = epoll_create1(0);
+  AddFd(epfd, fd);
+  std::vector<epoll_event> v(1);
+  int cnt = 0;
+  Send(fd, "hello\n");
+  while (true) {
+    constexpr int timeout = -1;
+    int ret = epoll_wait(epfd, v.data(), v.size(), timeout);
+    if (ret == -1) {
+      std::cout << "errno: " << strerror(errno) << '\n';
+      break;
+    }
+    for (int i = 0; i < ret; ++i) {
+      if (v[i].events & EPOLLIN) {
+        if (PrintReceiveMessage(v[i].data.fd)) {
+          ModFd(epfd, v[i].data.fd, EPOLLOUT);
+        } else {
+          break;
+        }
+      } else if (v[i].events & EPOLLOUT) {
+        Send(v[i].data.fd, std::to_string(cnt));
+        ++cnt;
+        ModFd(epfd, v[i].data.fd, EPOLLIN);
+      }
+    }
+  }
+  close(epfd);
+  close(fd);
+}
+
+epoll_tcp_server.cpp
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <strings.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cassert>
+#include <cstring>
+#include <iostream>
+#include <unordered_map>
+#include <vector>
+
+sockaddr_in SockAddress(int port, const std::string &ip) {
+  sockaddr_in res;
+  res.sin_family = AF_INET;
+  res.sin_port = htons(port);
+  inet_pton(AF_INET, ip.c_str(), &res.sin_addr);  // res.sin_addr.s_addr = htonl(INADDR_ANY);
+  bzero(&(res.sin_zero), 8);
+  return res;
+}
+
+int ListenFd(int port, const std::string &ip, int backlog = 5) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  int reuse = 1;
+  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  sockaddr_in address = SockAddress(port, ip);
+  if (bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  if (listen(fd, backlog) == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  return fd;
+}
+
+int AcceptFd(int listen_fd) {
+  sockaddr_in client;
+  socklen_t client_address_length = sizeof(client);
+  int accept_fd = accept(listen_fd, reinterpret_cast<sockaddr *>(&client), &client_address_length);
+  if (accept_fd == -1) {
+    std::cout << "errno: " << strerror(errno) << '\n';
+    return -1;
+  }
+  std::cout << "receive connect request from " << inet_ntoa(client.sin_addr)
+            << ':' << ntohs(client.sin_port) << '\n';
+  return accept_fd;
+}
+
+void Send(int accept_fd, const std::string &s) {
+  send(accept_fd, s.c_str(), strlen(s.c_str()), 0);
+}
+
+bool PrintReceiveMessage(int fd, std::string &s) {
+  char buf[1024] = {};
+  int n = recv(fd, buf, sizeof(buf) - 1, 0);
+  if (n <= 0) {
+    return false;
+  }
+  std::cout << n << " bytes message: " << buf << '\n';
+  s = std::string{buf};
+  return true;
+}
+
+int SetNonBlocking(int fd) {  // evutil_make_socket_nonblocking
+  int old_option = fcntl(fd, F_GETFL);
+  int new_option = old_option | O_NONBLOCK;
+  fcntl(fd, F_SETFL, new_option);
+  return old_option;
+}
+
+void AddFd(int epfd, int fd) {
+  epoll_event ev;
+  ev.data.fd = fd;
+  ev.events = EPOLLIN | EPOLLET;
+  epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+  SetNonBlocking(fd);
+}
+
+void DelFd(int epfd, int fd) {
+  epoll_event ev;
+  ev.data.fd = fd;
+  ev.events = EPOLLIN;
+  epoll_ctl(epfd, EPOLL_CTL_DEL, fd, &ev);
+}
+
+void ModFd(int epfd, int fd, int op) {
+  epoll_event ev;
+  ev.data.fd = fd;
+  ev.events = op;
+  epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+}
+
+int main() {
+  int listen_fd = ListenFd(12345, "0.0.0.0");
+  assert(listen_fd != -1);
+  int epfd = epoll_create1(0);
+  AddFd(epfd, listen_fd);
+  std::vector<epoll_event> v(1000);
+  std::unordered_map<int, std::string> m;
+  while (true) {
+    constexpr int timeout = -1;
+    int ret = epoll_wait(epfd, v.data(), v.size(), timeout);
+    if (ret == -1) {
+      std::cout << "errno: " << strerror(errno) << '\n';
+      break;
+    }
+    for (int i = 0; i < ret; ++i) {
+      int fd = v[i].data.fd;
+      if (fd == listen_fd) {
+        AddFd(epfd, AcceptFd(listen_fd));
+      } else if (v[i].events & EPOLLIN) {
+        if (PrintReceiveMessage(fd, m[fd])) {
+          ModFd(epfd, fd, EPOLLOUT);
+        } else {
+          DelFd(epfd, fd);
+          close(fd);
+        }
+      } else if (v[i].events & EPOLLOUT) {
+        Send(fd, m[fd]);
+        ModFd(epfd, fd, EPOLLIN);
+      }
+    }
+  }
+  close(epfd);
+  close(listen_fd);
+}
+
